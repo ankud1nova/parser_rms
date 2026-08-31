@@ -1,0 +1,9 @@
+.venv/
+.venv-win/
+__pycache__/
+*.py[cod]
+dmn_for_parser/
+*.xlsx
+~$*.xlsx
+.DS_Store
+.idea/
