@@ -13,7 +13,6 @@ from openpyxl.utils import get_column_letter
 
 
 PROJECT_FOLDER = Path(__file__).resolve().parent
-DMN_FOLDER = PROJECT_FOLDER / "dmn_for_parser"
 OUTPUT_FOLDER = PROJECT_FOLDER
 
 EXPRESSION_TAGS = {
@@ -111,8 +110,15 @@ def dmn_text(element: Optional[ET.Element]) -> str:
 
 def direct_expression(element: ET.Element) -> Optional[ET.Element]:
     for node in list(element):
-        if local_name(node.tag) in EXPRESSION_TAGS:
+        node_kind = local_name(node.tag)
+        if node_kind in EXPRESSION_TAGS:
             return node
+        # In KIE/Drools DMN files a BKM expression is wrapped in
+        # encapsulatedLogic. The wrapper itself is not useful in the report,
+        # so return the actual expression contained in it.
+        if node_kind == "encapsulatedLogic":
+            nested_expression = direct_expression(node)
+            return nested_expression if nested_expression is not None else node
     return None
 
 
@@ -133,6 +139,26 @@ def xml_parse_file(dmn_file: Path) -> tuple[str, ET.Element]:
             raise
         root = ET.fromstring(xml_text[start:end + 1])
     return xml_text, root
+
+
+def discover_dmn_files() -> list[Path]:
+    """Find DMN files both next to the script and in its subfolders."""
+    files = []
+    for path in PROJECT_FOLDER.rglob("*"):
+        if not path.is_file() or path.suffix.lower() != ".dmn":
+            continue
+        relative_parts = path.relative_to(PROJECT_FOLDER).parts
+        if any(part.startswith(".") for part in relative_parts):
+            continue
+        files.append(path)
+    return sorted(files, key=lambda path: str(path.relative_to(PROJECT_FOLDER)).lower())
+
+
+def relative_dmn_path(dmn_file: Path) -> str:
+    try:
+        return str(dmn_file.relative_to(PROJECT_FOLDER))
+    except ValueError:
+        return str(dmn_file)
 
 
 def detect_dmn_source(xml_text: str) -> str:
@@ -318,18 +344,44 @@ def output_header(output_node: ET.Element) -> str:
     return "\n".join(parts)
 
 
-def write_decision_table(ws, decision: ET.Element, decision_table: ET.Element, start_row: int) -> tuple[int, int]:
-    decision_name = element_name(decision, "Decision")
+def decision_table_name(owner: ET.Element, decision_table: ET.Element, table_number: int) -> str:
+    owner_name = element_name(owner, local_name(owner.tag))
+    parent_by_child = {nested: parent for parent in owner.iter() for nested in list(parent)}
+    current = parent_by_child.get(decision_table)
+    while current is not None and current is not owner:
+        if local_name(current.tag) == "contextEntry":
+            variable_name, _ = variable_info(current)
+            if variable_name:
+                return f"{owner_name} / {variable_name}"
+        current = parent_by_child.get(current)
+    if table_number > 1:
+        return f"{owner_name} / table {table_number}"
+    return owner_name
+
+
+def write_decision_table(
+    ws,
+    owner: ET.Element,
+    decision_table: ET.Element,
+    start_row: int,
+    table_number: int,
+) -> tuple[int, int]:
+    owner_kind = local_name(owner.tag)
+    owner_name = element_name(owner, owner_kind)
+    table_name = decision_table_name(owner, decision_table, table_number)
     inputs = children(decision_table, "input")
     outputs = children(decision_table, "output")
     rules = children(decision_table, "rule")
     row = start_row
 
-    ws.cell(row=row, column=1, value=f"=== Decision table: {decision_name} ===")
+    ws.cell(row=row, column=1, value=f"=== Decision table: {table_name} ===")
     row += 1
     for key, value in [
-        ("Decision", decision_name),
-        ("Decision ID", attr(decision, "id")),
+        ("Owner type", owner_kind),
+        ("Owner", owner_name),
+        ("Owner ID", attr(owner, "id")),
+        ("Table", table_name),
+        ("Table ID", attr(decision_table, "id")),
         ("Hit Policy", attr(decision_table, "hitPolicy")),
         ("Aggregation", attr(decision_table, "aggregation")),
         ("Preferred Orientation", attr(decision_table, "preferredOrientation")),
@@ -438,7 +490,7 @@ def write_expression(ws, owner: ET.Element, start_row: int, owner_label: str) ->
 def write_model_overview(ws, root: ET.Element, xml_text: str, dmn_file: Path):
     append_section(ws, "Паспорт DMN-файла")
     append_key_value(ws, "File", dmn_file.name)
-    append_key_value(ws, "Relative path", str(dmn_file.relative_to(DMN_FOLDER)))
+    append_key_value(ws, "Relative path", relative_dmn_path(dmn_file))
     append_key_value(ws, "Source", detect_dmn_source(xml_text))
     append_key_value(ws, "DMN Version", get_dmn_version(root))
     append_key_value(ws, "Definitions Name", attr(root, "name"))
@@ -566,15 +618,26 @@ def write_file_sheet(wb: Workbook, dmn_file: Path, xml_text: str, root: ET.Eleme
             decision_tables = descendants(decision, "decisionTable")
             if decision_tables:
                 decision_tables_total += len(decision_tables)
-                for decision_table in decision_tables:
-                    row, rules_count = write_decision_table(ws, decision, decision_table, row)
+                for table_number, decision_table in enumerate(decision_tables, start=1):
+                    row, rules_count = write_decision_table(
+                        ws, decision, decision_table, row, table_number
+                    )
                     rules_total += rules_count
             else:
                 row = write_expression(ws, decision, row, "Decision")
 
     bkms = descendants(root, "businessKnowledgeModel")
     for bkm in bkms:
-        row = write_expression(ws, bkm, row, "Business knowledge model")
+        decision_tables = descendants(bkm, "decisionTable")
+        if decision_tables:
+            decision_tables_total += len(decision_tables)
+            for table_number, decision_table in enumerate(decision_tables, start=1):
+                row, rules_count = write_decision_table(
+                    ws, bkm, decision_table, row, table_number
+                )
+                rules_total += rules_count
+        else:
+            row = write_expression(ws, bkm, row, "Business knowledge model")
 
     return ParseResult(
         file=dmn_file,
@@ -608,7 +671,7 @@ def write_summary_sheet(ws, results: list[ParseResult]):
     ])
     for result in results:
         append_row(ws, [
-            str(result.file.relative_to(DMN_FOLDER)),
+            relative_dmn_path(result.file),
             result.sheet,
             result.status,
             result.source,
@@ -624,12 +687,9 @@ def write_summary_sheet(ws, results: list[ParseResult]):
 
 
 def export_all_dmn_files():
-    if not DMN_FOLDER.exists():
-        raise FileNotFoundError(f"Папка не найдена: {DMN_FOLDER}")
-
-    dmn_files = sorted(DMN_FOLDER.rglob("*.dmn"))
+    dmn_files = discover_dmn_files()
     if not dmn_files:
-        raise ValueError(f"В папке нет .dmn файлов: {DMN_FOLDER}")
+        raise ValueError(f"В проекте нет .dmn файлов: {PROJECT_FOLDER}")
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = OUTPUT_FOLDER / f"result_{timestamp}.xlsx"
@@ -651,7 +711,7 @@ def export_all_dmn_files():
             xml_text, root = xml_parse_file(dmn_file)
             results.append(write_file_sheet(wb, dmn_file, xml_text, root))
 
-            relative_file = str(dmn_file.relative_to(DMN_FOLDER))
+            relative_file = relative_dmn_path(dmn_file)
             for row in collect_inputs(root):
                 append_row(inputs_ws, row + [relative_file])
             for row in collect_item_definitions(root):
